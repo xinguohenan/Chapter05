@@ -2,8 +2,9 @@ package com.sample.startup.gc;
 
 
 import android.annotation.SuppressLint;
+import android.os.Build;
 import android.os.SystemClock;
-import android.support.annotation.Nullable;
+import android.support.annotation.RequiresApi;
 import android.util.Log;
 
 import java.io.File;
@@ -17,11 +18,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.function.Predicate;
 
 
 /**
- * 有bug, 之前没有现在有，而且更新的时候也有问题
- * 之前有，现在没有，当0处理
+ * Try to analyze current process's thread/cpu info.
+ * Linux's process information document:
+ * http://man7.org/linux/man-pages/man5/proc.5.html
  */
 public class ProcessCpuTracker {
     private static final String TAG = "ProcessCpuTracker";
@@ -32,6 +35,7 @@ public class ProcessCpuTracker {
     private static final int PROCESS_STATS_MAJOR_FAULTS = 11 - 2;
     private static final int PROCESS_STATS_UTIME = 13 - 2;
     private static final int PROCESS_STATS_STIME = 14 - 2;
+    private static final int PROCESS_NICE_VALUE = 18 - 2;
 
     // /proc/
     private static final String NR_VOLUNTARY_SWITCHES = "nr_voluntary_switches";
@@ -122,6 +126,13 @@ public class ProcessCpuTracker {
         public int rel_majfaults;
         public String status;
 
+        /**
+         * The nice value, a value in the range 19 (low priority) to -20 (high priority).
+         */
+        public int nice;
+
+        public boolean expired;
+
         Stats(int _pid, boolean isThread) {
             pid = _pid;
             if (isThread) {
@@ -149,6 +160,7 @@ public class ProcessCpuTracker {
 
     }
 
+    @RequiresApi(api = Build.VERSION_CODES.N)
     public void update() {
         if (DEBUG) {
             android.util.Log.v(TAG, "Update: " + this);
@@ -210,6 +222,10 @@ public class ProcessCpuTracker {
         getName(mCurrentProcStat, mCurrentProcStat.cmdlineFile);
         collectProcsStats("/proc/self/stat", mCurrentProcStat);
         if (mCurrentProcStat.workingThreads != null) {
+            for (Stats threadStat : mCurrentProcStat.workingThreads) {
+                // Mark all threads as expired firstly, because some threads may already get destroyed.
+                threadStat.expired = true;
+            }
             File[] threadsProcFiles = new File(mCurrentProcStat.threadsDir).listFiles();
             for (File thread : threadsProcFiles) {
                 int threadID = Integer.parseInt(thread.getName());
@@ -221,8 +237,19 @@ public class ProcessCpuTracker {
                     getName(threadStat, threadStat.cmdlineFile);
                     mCurrentProcStat.workingThreads.add(threadStat);
                 }
+                // The thread is still valid, make expired as false.
+                threadStat.expired = false;
                 collectProcsStats(threadStat.statFile, threadStat);
             }
+
+            // Remove the threads that are already destroyed.
+            mCurrentProcStat.workingThreads.removeIf(new Predicate<Stats>() {
+                @Override
+                public boolean test(Stats stat) {
+                    return stat.expired;
+                }
+            });
+
             Collections.sort(mCurrentProcStat.workingThreads, sLoadComparator);
         }
 
@@ -245,7 +272,6 @@ public class ProcessCpuTracker {
         }
     }
 
-    @Nullable
     private Stats findThreadStat(int id, ArrayList<Stats> stats) {
         for (Stats stat : stats) {
             if (stat.pid == id) {
@@ -268,6 +294,7 @@ public class ProcessCpuTracker {
         final long majfaults = Long.parseLong(procStats[PROCESS_STATS_MAJOR_FAULTS]);
         final long utime = Long.parseLong(procStats[PROCESS_STATS_UTIME]) * mJiffyMillis;
         final long stime = Long.parseLong(procStats[PROCESS_STATS_STIME]) * mJiffyMillis;
+        final int niceValue = Integer.parseInt(procStats[PROCESS_NICE_VALUE]);
 
         if (DEBUG) {
             android.util.Log.v(TAG, "Stats changed " + st.name + " status:" + status + " pid=" + st.pid
@@ -289,6 +316,7 @@ public class ProcessCpuTracker {
         st.base_minfaults = minfaults;
         st.base_majfaults = majfaults;
         st.status = status;
+        st.nice = niceValue;
     }
 
 
@@ -409,20 +437,20 @@ public class ProcessCpuTracker {
         Stats st = mCurrentProcStat;
         printProcessCPU(pw,
                 st.pid, st.name, st.status, (int) st.rel_uptime,
-                st.rel_utime, st.rel_stime, 0, 0, 0, 0, st.rel_minfaults, st.rel_majfaults);
+                st.rel_utime, st.rel_stime, 0, 0, 0, 0, st.rel_minfaults, st.rel_majfaults, st.nice);
         if (st.workingThreads != null) {
-            pw.println("thread stats:");
+            pw.println("thread stats: thread count: " + st.workingThreads.size());
             int M = st.workingThreads.size();
             for (int j = 0; j < M; j++) {
                 Stats tst = st.workingThreads.get(j);
                 printProcessCPU(pw,
                         tst.pid, tst.name, tst.status, (int) st.rel_uptime,
-                        tst.rel_utime, tst.rel_stime, 0, 0, 0, 0, tst.rel_minfaults, tst.rel_majfaults);
+                        tst.rel_utime, tst.rel_stime, 0, 0, 0, 0, tst.rel_minfaults, tst.rel_majfaults, tst.nice);
             }
         }
 
         printProcessCPU(pw, -1, "TOTAL", "", totalTime, mRelUserTime, mRelSystemTime,
-                mRelIoWaitTime, mRelIrqTime, mRelSoftIrqTime, mRelIdleTime, 0, 0);
+                mRelIoWaitTime, mRelIrqTime, mRelSoftIrqTime, mRelIdleTime, 0, 0, st.nice);
         pw.println(printCurrentLoad());
 
         if (DEBUG) {
@@ -448,7 +476,7 @@ public class ProcessCpuTracker {
 
     private void printProcessCPU(PrintWriter pw, int pid, String label, String status,
                                  int totalTime, int user, int system, int iowait, int irq, int softIrq, int idle,
-                                 int minFaults, int majFaults) {
+                                 int minFaults, int majFaults, int nice) {
         if (totalTime == 0) {
             totalTime = 1;
         }
@@ -459,7 +487,8 @@ public class ProcessCpuTracker {
             pw.print("/");
         }
         pw.print(label + "(" + status + ")");
-        pw.print(": ");
+        pw.print(" nice: " + nice);
+        pw.print(" : ");
         printRatio(pw, user, totalTime);
         pw.print("% user + ");
         printRatio(pw, system, totalTime);
@@ -497,6 +526,7 @@ public class ProcessCpuTracker {
                 pw.print(" major");
             }
         }
+
         pw.println();
     }
 
@@ -524,7 +554,13 @@ public class ProcessCpuTracker {
         } catch (IOException e) {
             //
         } finally {
-            SystemInfo.closeQuietly(is);
+            if (is != null) {
+                try {
+                    is.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
         }
         return null;
     }
@@ -550,7 +586,6 @@ public class ProcessCpuTracker {
         }
     }
 
-    @Nullable
     protected String[] readProcFile(String file) {
         RandomAccessFile procFile = null;
         String procFileContents;
@@ -567,9 +602,13 @@ public class ProcessCpuTracker {
             ioe.printStackTrace();
             return null;
         } finally {
-            SystemInfo.closeQuietly(procFile);
+            try {
+                if (procFile != null) {
+                    procFile.close();
+                }
+            } catch (IOException e) {
+                //
+            }
         }
-
     }
-
 }
